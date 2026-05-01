@@ -8,11 +8,15 @@ from transformers import (
     HfArgumentParser, 
 )
 from model.load_model import get_qwen_vl_generation_backbone, load_qwen_vl_generation_model
-from trainer import QwenSFTTrainer
+from trainer import QwenSFTTrainer, GenerativeEvalPrediction
 from dataset import make_supervised_data_module
 from params import DataArguments, ModelArguments, TrainingArguments
 from train.train_utils import get_peft_state_maybe_zero_3, get_peft_state_non_lora_maybe_zero_3, safe_save_model_for_hf_trainer
 import pathlib
+
+import json
+import re
+import editdistance
 
 local_rank = None
 
@@ -78,6 +82,161 @@ def unfreeze_topk_layers(model, k_llm: int = 0, k_vis: int = 0):
             for p in blk.parameters():
                 p.requires_grad = True
 
+# Validation 
+
+# Precaution if model does not return raw json
+def clean_output(text):
+    text = text.strip()
+
+    if text.startswith("```json"):
+        text = text[7:]
+    elif text.startswith("```"):
+        text = text[3:]
+
+    if text.endswith("```"):
+        text = text[:-3]
+
+    return text.strip()
+
+# So evaluation does not crash
+def parse_json_safe(text):
+    try:
+        return json.loads(clean_output(text))
+    except Exception:
+        return None
+
+# Converts to lower, strips whitespace from sides and unifies 
+# whitespaces in text into just space
+def normalize_text(text):
+    if text is None:
+        return ""
+
+    text = str(text).lower().strip()
+    text = re.sub(r"\s+", " ", text)
+
+    return text
+
+
+def levenshtein_similarity(expected, actual):
+    expected = normalize_text(expected)
+    actual = normalize_text(actual)
+
+    if not expected and not actual:
+        return 1.0
+
+    if not expected or not actual:
+        return 0.0
+
+    distance = editdistance.eval(expected, actual)
+    max_len = max(len(expected), len(actual))
+
+    return 1.0 - (distance / max_len)
+
+
+def normalize_authors(authors):
+    result = []
+
+    if not isinstance(authors, list):
+        return result
+
+    for author in authors:
+        if isinstance(author, dict):
+            first = normalize_text(author.get("firstName", ""))
+            last = normalize_text(author.get("lastName", ""))
+            full_name = f"{first} {last}".strip()
+
+            if full_name:
+                result.append(full_name)
+        else:
+            text = normalize_text(author)
+            if text:
+                result.append(text)
+
+    return result
+
+
+def f1_from_lists(expected_list, actual_list):
+    expected_set = set(
+        normalize_text(x)
+        for x in expected_list
+        if normalize_text(x)
+    )
+
+    actual_set = set(
+        normalize_text(x)
+        for x in actual_list
+        if normalize_text(x)
+    )
+
+    if not expected_set and not actual_set:
+        return 1.0
+
+    if not expected_set or not actual_set:
+        return 0.0
+
+    tp = len(expected_set & actual_set)
+    fp = len(actual_set - expected_set)
+    fn = len(expected_set - actual_set)
+
+    if tp == 0:
+        return 0.0
+
+    precision = tp / (tp + fp)
+    recall = tp / (tp + fn)
+
+    return 2 * precision * recall / (precision + recall)
+
+
+def compute_metrics(eval_pred: GenerativeEvalPrediction):
+    predictions = eval_pred.predictions
+    references = eval_pred.references
+
+    total = len(predictions)
+
+    if total == 0:
+        return {
+            "json_valid_rate": 0.0,
+            "title_levenshtein": 0.0,
+            "authors_f1": 0.0,
+        }
+
+    json_valid_count = 0
+    title_scores = []
+    authors_scores = []
+
+    for pred_text, ref_text in zip(predictions, references):
+        pred_json = parse_json_safe(pred_text)
+        ref_json = parse_json_safe(ref_text)
+
+        # Invalid json 
+        if pred_json is None or ref_json is None:
+            title_scores.append(0.0)
+            authors_scores.append(0.0)
+            continue
+
+        json_valid_count += 1
+
+        title_score = levenshtein_similarity(
+            ref_json.get("title", ""),
+            pred_json.get("title", "")
+        )
+
+        expected_authors = normalize_authors(ref_json.get("authors", []))
+        actual_authors = normalize_authors(pred_json.get("authors", []))
+
+        authors_score = f1_from_lists(
+            expected_authors,
+            actual_authors
+        )
+
+        title_scores.append(title_score)
+        authors_scores.append(authors_score)
+
+    return {
+        "json_valid_rate": json_valid_count / total,
+        "title_levenshtein": sum(title_scores) / total,
+        "authors_f1": sum(authors_scores) / total,
+    }
 
 def train():
     global local_rank
@@ -222,6 +381,7 @@ def train():
         model=model,
         processing_class=processor,
         args=training_args,
+        compute_metrics=compute_metrics,
         **data_module
     )
 
