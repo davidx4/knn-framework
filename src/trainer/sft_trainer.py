@@ -388,6 +388,10 @@ class QwenSFTTrainer(Trainer):
                 batch_input_ids.device
             )
 
+            # Qwen2.5-VL, PEFT, Transformers compatibility:
+            # Some processors add mm_token_type_ids, but generate() rejects it
+            gen_inputs.pop("mm_token_type_ids", None)
+
             # Generate
             with torch.no_grad():
                 generated_ids = unwrapped_model.generate(
